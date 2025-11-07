@@ -34,7 +34,7 @@ public class RagNaifAvecLogging {
     private static void configureLogger() {
 
         Logger packageLogger = Logger.getLogger("dev.langchain4j");
-        packageLogger.setLevel(Level.FINE); 
+        packageLogger.setLevel(Level.FINE);
 
         ConsoleHandler handler = new ConsoleHandler();
         handler.setLevel(Level.FINE);
