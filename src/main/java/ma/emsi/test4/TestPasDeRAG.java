@@ -9,7 +9,7 @@ import dev.langchain4j.data.document.splitter.DocumentSplitters;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.memory.chat.MessageWindowChatMemory;
-import dev.langchain4j.model.chat.ChatLanguageModel;
+import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.embedding.onnx.allminilml6v2.AllMiniLmL6V2EmbeddingModel;
 import dev.langchain4j.model.googleai.GoogleAiGeminiChatModel;
@@ -35,6 +35,9 @@ import java.util.logging.Logger;
 
 public class TestPasDeRAG {
 
+    /**
+     * Configure le logger pour voir les détails du routage
+     */
     private static void configureLogger() {
         Logger packageLogger = Logger.getLogger("dev.langchain4j");
         packageLogger.setLevel(Level.FINE);
@@ -43,20 +46,31 @@ public class TestPasDeRAG {
         packageLogger.addHandler(handler);
     }
 
+    /**
+     * Ingère un document et retourne l'EmbeddingStore
+     */
     private static EmbeddingStore<TextSegment> ingestDocument(
             Path documentPath,
             EmbeddingModel embeddingModel,
             DocumentParser parser,
             DocumentSplitter splitter) {
 
+        System.out.println("Ingestion du document : " + documentPath.getFileName());
         Document document = FileSystemDocumentLoader.loadDocument(documentPath, parser);
         List<TextSegment> segments = splitter.split(document);
+        System.out.println("  - " + segments.size() + " segments créés");
+
         List<Embedding> embeddings = embeddingModel.embedAll(segments).content();
         EmbeddingStore<TextSegment> embeddingStore = new InMemoryEmbeddingStore<>();
         embeddingStore.addAll(embeddings, segments);
+        System.out.println("  - Embeddings stockés\n");
+
         return embeddingStore;
     }
 
+    /**
+     * Crée un ContentRetriever
+     */
     private static ContentRetriever createContentRetriever(
             EmbeddingStore<TextSegment> embeddingStore,
             EmbeddingModel embeddingModel) {
@@ -71,20 +85,27 @@ public class TestPasDeRAG {
 
     public static void main(String[] args) {
         configureLogger();
+        System.out.println("=== Test 4 : Routage intelligent - RAG ou pas RAG ===\n");
 
         String geminiApiKey = System.getenv("GEMINI");
         if (geminiApiKey == null || geminiApiKey.isEmpty()) {
-            System.err.println("Erreur : La variable d'environnement GEMINI n'est pas definie.");
+            System.err.println("Erreur : La variable d'environnement GEMINI n'est pas définie.");
             return;
         }
 
-        ChatLanguageModel chatModel = GoogleAiGeminiChatModel.builder()
+        // Création du ChatModel (version 1.8.0)
+        System.out.println("Connexion au modèle Gemini...");
+        ChatModel chatModel = GoogleAiGeminiChatModel.builder()
                 .apiKey(geminiApiKey)
                 .modelName("gemini-2.0-flash-exp")
                 .temperature(0.7)
                 .logRequestsAndResponses(true)
                 .build();
+        System.out.println("Modèle connecté\n");
 
+        System.out.println("=== PHASE 1 : Ingestion du document ===\n");
+
+        // Ingestion du document sur l'IA
         Path documentIA = Paths.get("src/main/resources/support_rag.pdf");
         DocumentParser parser = new ApacheTikaDocumentParser();
         DocumentSplitter splitter = DocumentSplitters.recursive(300, 30);
@@ -94,75 +115,90 @@ public class TestPasDeRAG {
                 documentIA, embeddingModel, parser, splitter);
         ContentRetriever contentRetriever = createContentRetriever(embeddingStore, embeddingModel);
 
-        // Template de prompt pour le routage
+        System.out.println("=== PHASE 2 : Configuration du QueryRouter personnalisé ===\n");
+
+        // Template de prompt pour décider si la question porte sur l'IA
         PromptTemplate promptTemplate = PromptTemplate.from(
                 "Est-ce que la requête '{{question}}' porte sur l'IA ? " +
                         "Réponds seulement par 'oui', 'non' ou 'peut-être'."
         );
 
         // QueryRouter personnalisé avec classe anonyme
+        // Ce router décide d'utiliser le RAG ou non selon le sujet de la question
         QueryRouter queryRouter = new QueryRouter() {
             @Override
             public Collection<ContentRetriever> route(Query query) {
-                // Création du prompt avec la question
+                // Création du prompt avec la question de l'utilisateur
                 Map<String, Object> variables = new HashMap<>();
                 variables.put("question", query.text());
                 Prompt prompt = promptTemplate.apply(variables);
 
-                // Demande au LM si la question porte sur l'IA
-                String answer = chatModel.generate(prompt.text()).trim().toLowerCase();
+                // Demande au LLM si la question porte sur l'IA
+                String answer = chatModel.chat(prompt.text()).trim().toLowerCase();
 
-                System.out.println("[QueryRouter] Question: " + query.text());
-                System.out.println("[QueryRouter] Réponse du LM: " + answer);
+                System.out.println("\n[QueryRouter] Question analysée : " + query.text());
+                System.out.println("[QueryRouter] Réponse du LLM : '" + answer + "'");
 
-                // CORRECTION: N'activer le RAG que si la réponse est "oui"
                 // Stratégie conservative : seul un "oui" clair active le RAG
                 if (answer.contains("oui")) {
-                    System.out.println("[QueryRouter] RAG activé");
+                    System.out.println("[QueryRouter] ✓ RAG ACTIVÉ - La question porte sur l'IA");
+                    System.out.println("[QueryRouter] Les documents seront consultés\n");
                     return Collections.singletonList(contentRetriever);
                 }
 
                 // Pour "non" ou "peut-être", pas de RAG
-                System.out.println("[QueryRouter] RAG désactivé");
+                System.out.println("[QueryRouter] ✗ RAG DÉSACTIVÉ - Question hors sujet");
+                System.out.println("[QueryRouter] Réponse directe du LLM sans consultation des documents\n");
                 return Collections.emptyList();
             }
         };
+
+        System.out.println("QueryRouter personnalisé configuré");
+        System.out.println("  - Il décidera d'utiliser le RAG uniquement pour les questions sur l'IA\n");
 
         // Configuration du RetrievalAugmentor avec le QueryRouter personnalisé
         RetrievalAugmentor retrievalAugmentor = DefaultRetrievalAugmentor.builder()
                 .queryRouter(queryRouter)
                 .build();
 
-        // Configuration de l'assistant avec le RetrievalAugmentor
+        // Configuration de l'assistant (version 1.8.0 utilise .chatModel())
         Assistant assistant = AiServices.builder(Assistant.class)
-                .chatLanguageModel(chatModel)
+                .chatModel(chatModel) // Version 1.8.0
                 .chatMemory(MessageWindowChatMemory.withMaxMessages(10))
                 .retrievalAugmentor(retrievalAugmentor)
                 .build();
 
-        Scanner scanner = new Scanner(System.in);
-
-        System.out.println("=== Test 4 - Routage intelligent avec QueryRouter personnalisé ===");
+        System.out.println("=== Assistant RAG intelligent prêt ! ===\n");
         System.out.println("Le système décide automatiquement d'utiliser le RAG ou non.");
-        System.out.println("Tapez 'quitter' ou 'exit' pour terminer.\n");
+        System.out.println("Essayez différents types de questions :");
+        System.out.println("  - Questions sur l'IA → RAG activé");
+        System.out.println("  - Questions générales → RAG désactivé");
+        System.out.println("\nTapez 'quitter' ou 'exit' pour terminer.\n");
+
+        // Boucle de questions-réponses
+        Scanner scanner = new Scanner(System.in);
 
         while (true) {
             System.out.print("Votre question : ");
             String question = scanner.nextLine().trim();
 
             if (question.equalsIgnoreCase("quitter") || question.equalsIgnoreCase("exit")) {
-                System.out.println("Au revoir !");
+                System.out.println("\nAu revoir !");
                 break;
             }
 
             if (question.isEmpty()) {
+                System.out.println("Veuillez poser une question.\n");
                 continue;
             }
 
             try {
+                System.out.println("=".repeat(80));
                 String reponse = assistant.chat(question);
-                System.out.println("\nReponse : " + reponse + "\n");
-                System.out.println("-".repeat(80) + "\n");
+                System.out.println("=".repeat(80));
+                System.out.println("\n--- Réponse ---");
+                System.out.println(reponse);
+                System.out.println("---------------\n");
             } catch (Exception e) {
                 System.err.println("Erreur : " + e.getMessage());
                 e.printStackTrace();
